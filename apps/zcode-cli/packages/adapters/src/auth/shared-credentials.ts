@@ -1,3 +1,4 @@
+// Modified in this fork (standalone-account-patches, Apache-2.0): see patch_docs/README.md.
 import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -18,6 +19,7 @@ export const SHARED_ZCODE_CREDENTIAL_KEYS = {
   bigmodelRefreshToken: "oauth:bigmodel:refresh_token",
   bigmodelUserInfo: "oauth:bigmodel:user_info",
   zaiAccessToken: "oauth:zai:access_token",
+  zaiBusinessToken: "oauth:zai:business_token",
   zaiRefreshToken: "oauth:zai:refresh_token",
   zaiUserInfo: "oauth:zai:user_info",
   zcodeJwtToken: "zcodejwttoken",
@@ -47,6 +49,8 @@ export interface SharedZCodeCredentialStore {
   readonly filePath: string;
   clearZaiLoginCredentials(): Promise<void>;
   delete(key: string): Promise<void>;
+  /** 条件事务：值经解密后交给谓词判断，匹配才在同一把文件锁内删除；缺席键恒为 false。 */
+  deleteIf(key: string, matches: (value: string) => boolean): Promise<boolean>;
   deleteIfValue(key: string, expectedValue: string): Promise<boolean>;
   deleteIfValues(
     expectedValues: Readonly<Record<string, string>>,
@@ -80,6 +84,8 @@ export function createSharedZCodeCredentialStore(
         const activeProviderRaw = rawCredentials[SHARED_ZCODE_CREDENTIAL_KEYS.activeProvider];
         const activeProvider = activeProviderRaw ? cipher.decrypt(activeProviderRaw) : null;
         delete rawCredentials[SHARED_ZCODE_CREDENTIAL_KEYS.zaiAccessToken];
+        // 业务 JWT 是 zaiAccessToken 的派生凭据；退出登录必须一并清除。
+        delete rawCredentials[SHARED_ZCODE_CREDENTIAL_KEYS.zaiBusinessToken];
         delete rawCredentials[SHARED_ZCODE_CREDENTIAL_KEYS.zaiRefreshToken];
         delete rawCredentials[SHARED_ZCODE_CREDENTIAL_KEYS.zaiUserInfo];
         delete rawCredentials[SHARED_ZCODE_CREDENTIAL_KEYS.zcodeJwtToken];
@@ -94,6 +100,26 @@ export function createSharedZCodeCredentialStore(
       await mutateRawCredentialRecord(filePath, (rawCredentials) => {
         delete rawCredentials[validatedKey];
       });
+    },
+
+    async deleteIf(
+      key: string,
+      matches: (value: string) => boolean,
+    ): Promise<boolean> {
+      const validatedKey = validateCredentialKey(key);
+      let deleted = false;
+      await mutateRawCredentialRecord(filePath, (rawCredentials) => {
+        const encryptedValue = rawCredentials[validatedKey];
+        if (encryptedValue === undefined) return;
+        // 检查与删除必须共用同一次持锁读改写；先 load 再 delete 会与另一进程的
+        // save 竞态：检查读到旧值，无条件的 delete 却删掉刚落盘的新一代记录。
+        if (!matches(cipher.decrypt(encryptedValue))) {
+          return;
+        }
+        delete rawCredentials[validatedKey];
+        deleted = true;
+      });
+      return deleted;
     },
 
     async deleteIfValue(key: string, expectedValue: string): Promise<boolean> {

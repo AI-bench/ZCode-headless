@@ -1,3 +1,4 @@
+// Modified in this fork (standalone-account-patches, Apache-2.0): see patch_docs/README.md.
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -231,6 +232,103 @@ describe("ZCode CLI login", () => {
           },
         },
       });
+    } finally {
+      await rm(dir, { force: true, recursive: true });
+    }
+  });
+
+  it("login persists the long-lived business JWT to the credential store", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "zcode-login-business-token-"));
+    const credentialsBaseDir = join(dir, "home");
+    const personalProviderConfigPath = join(dir, "provider_config.json");
+    const credentialStore = createSharedZCodeCredentialStore({
+      baseDir: credentialsBaseDir,
+      env: TEST_ENV,
+    });
+    const businessToken = `header.${Buffer.from(
+      JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 15_552_000 }),
+    ).toString("base64url")}.signature`;
+    const httpClient = new FakeHttpClient([
+      jsonResponse({
+        code: 0,
+        msg: "",
+        data: {
+          flow_id: "flow-business-token",
+          poll_token: "poll-token",
+          authorize_url: "https://chat.z.ai/oauth/authorize?state=state",
+          expires_at: 9999999999,
+          poll_interval_sec: 2,
+        },
+      }),
+      jsonResponse({ code: 0, msg: "", data: { status: "pending" } }),
+      jsonResponse({
+        code: 0,
+        msg: "",
+        data: {
+          status: "ready",
+          token: "jwt-token",
+          user: { user_id: "u_1", email: "alice@example.com", name: "Alice" },
+          zai: { access_token: "zai-access-token" },
+        },
+      }),
+      jsonResponse({
+        code: 0,
+        data: { access_token: businessToken, expires_in: 15_552_000 },
+      }),
+      jsonResponse({
+        code: 200,
+        data: {
+          organizations: [
+            {
+              organizationId: "org-1",
+              organizationName: "默认机构",
+              projects: [{ projectId: "project-1", projectName: "默认项目" }],
+            },
+          ],
+        },
+      }),
+      jsonResponse({ code: 200, data: [] }),
+      jsonResponse({ code: 200, data: { apiKey: "zai-api-key", name: "zcode-api-key" } }),
+      jsonResponse({
+        code: 200,
+        data: {
+          accessToken: "project-token",
+          tokenType: "Bearer",
+          expiresIn: 600,
+          expiresAt: Math.floor(Date.now() / 1000) + 600,
+        },
+      }),
+    ]);
+
+    try {
+      await loginZCodeCli({
+        credentialStore,
+        env: TEST_ENV,
+        httpClient,
+        noBrowser: true,
+        now: () => 1_000,
+        pollToken: "poll-token",
+        sleep: async () => undefined,
+        personalProviderConfigPath,
+      });
+
+      const rawRecord = await credentialStore.load(
+        SHARED_ZCODE_CREDENTIAL_KEYS.zaiBusinessToken,
+      );
+      expect(rawRecord).not.toBeNull();
+      const record = JSON.parse(rawRecord!) as {
+        token: string;
+        expiresAt: number;
+        refreshAt: number;
+        scope?: string;
+      };
+      expect(record.token).toBe(businessToken);
+      expect(record.scope).toBe("u_1");
+      expect(record.expiresAt).toBeGreaterThan(Date.now() + 15_551_000_000);
+      expect(record.refreshAt).toBe(record.expiresAt - 120_000);
+      // 落盘内容必须加密：明文业务 JWT 不得出现在凭据文件里。
+      const rawFile = await readFile(credentialStore.filePath, "utf8");
+      expect(rawFile).not.toContain(businessToken);
     } finally {
       await rm(dir, { force: true, recursive: true });
     }
@@ -496,6 +594,44 @@ describe("ZCode CLI login", () => {
     abortController.abort(new Error("login cancelled"));
 
     await expect(loginPromise).rejects.toThrow("login cancelled");
+    expect(httpClient.requests).toHaveLength(2);
+  });
+
+  it("ZCODE_LOGIN_TIMEOUT_MS shortens the login window", async () => {
+    const httpClient = new FakeHttpClient([
+      jsonResponse({
+        code: 0,
+        msg: "",
+        data: {
+          flow_id: "flow-env-timeout",
+          poll_token: "poll-token",
+          authorize_url: "https://chat.z.ai/oauth/authorize?state=env-timeout",
+          expires_at: 9999999999,
+          poll_interval_sec: 2,
+        },
+      }),
+      jsonResponse({
+        code: 0,
+        msg: "",
+        data: {
+          status: "pending",
+        },
+      }),
+    ]);
+
+    await expect(
+      loginZCodeCli({
+        env: { ...TEST_ENV, ZCODE_LOGIN_TIMEOUT_MS: "1" },
+        httpClient,
+        noBrowser: true,
+        now: () => 1_000,
+        pollToken: "poll-token",
+        // 挂起的 sleep 让唯一的中止来源变成 1ms 的登录超时定时器。
+        sleep: () => new Promise<void>(() => undefined),
+      }),
+    ).rejects.toMatchObject({
+      code: "auth_timeout",
+    });
     expect(httpClient.requests).toHaveLength(2);
   });
 });

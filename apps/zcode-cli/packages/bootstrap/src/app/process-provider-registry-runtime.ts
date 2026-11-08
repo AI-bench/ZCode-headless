@@ -1,3 +1,4 @@
+// Modified in this fork (standalone-account-patches, Apache-2.0): see patch_docs/README.md.
 import {
   AccountProviderService,
   MutableAccountProviderConfigSource,
@@ -40,6 +41,61 @@ export interface ProcessProviderRegistryRuntimeOptions {
     readonly onBuiltinRefreshError?: (error: unknown) => void;
     readonly onBuiltinRefreshResult?: (event: ZCodeBuiltinRefreshEvent) => void;
   };
+}
+
+/** app-server 以 Standalone 身份持有账号登录的显式开关；桌面托管 Worker 不读取它。 */
+export const ZCODE_STANDALONE_ACCOUNT_ENV = "ZCODE_STANDALONE_ACCOUNT";
+
+/** ZCODE_STANDALONE_ACCOUNT=1|true 时进程自己解析账号凭据，默认保持 Host 托管语义。 */
+export function readStandaloneAccountEnabled(
+  env: Readonly<Record<string, string | undefined>>,
+): boolean {
+  const value = env[ZCODE_STANDALONE_ACCOUNT_ENV]?.trim();
+  return value === "1" || value === "true";
+}
+
+/** Standalone 观测回调的落点；app-server 传结构化 logger，CLI Standalone 传 stderr reporter。 */
+export interface ProcessProviderRegistryRuntimeLog {
+  debug(message: string, context?: Record<string, unknown>): void;
+  info(message: string, context?: Record<string, unknown>): void;
+  error(message: string, error?: Error, context?: Record<string, unknown>): void;
+}
+
+/** app-server 入口装配：开关关闭时保持托管语义；开启时把观测回调接到 logger。 */
+export function resolveProcessProviderRegistryRuntimeOptions(
+  env: Readonly<Record<string, string | undefined>>,
+  log: ProcessProviderRegistryRuntimeLog,
+): ProcessProviderRegistryRuntimeOptions {
+  if (!readStandaloneAccountEnabled(env)) return {};
+  return {
+    standalone: {
+      onAccountInitializationError: (error) =>
+        log.error(
+          "Standalone Account 初始化失败，账号 Provider 保持 fail-closed",
+          toLogError(error),
+          { event: "zcode_protocol.provider_registry.standalone_account_error" },
+        ),
+      onBuiltinRefreshError: (error) =>
+        log.error("ZCode Built-in 刷新失败", toLogError(error), {
+          event: "zcode_protocol.provider_registry.standalone_builtin_refresh_error",
+        }),
+      // TTL 检查不是生产事件；与 CLI stderr reporter 一致，只有更新留 info，其余降级 debug。
+      onBuiltinRefreshResult: (event) => {
+        const context = {
+          event: "zcode_protocol.provider_registry.standalone_builtin_refresh",
+          result: event.result,
+          ...(event.reason ? { reason: event.reason } : {}),
+          ...(event.revision !== undefined ? { revision: event.revision } : {}),
+        };
+        if (event.result === "updated") log.info(`ZCode Built-in ${event.result}`, context);
+        else log.debug(`ZCode Built-in ${event.result}`, context);
+      },
+    },
+  };
+}
+
+function toLogError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 export async function startProcessProviderRegistryRuntime(

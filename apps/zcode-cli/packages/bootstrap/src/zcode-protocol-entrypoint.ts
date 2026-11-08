@@ -1,3 +1,4 @@
+// Modified in this fork (standalone-account-patches, Apache-2.0): see patch_docs/README.md.
 import { createMcpTransportFetch } from "@zcode/adapters";
 import { createConfig, resolvePath } from "@zcode/adapters/config";
 import type { McpElicitationPort, McpNotificationPort } from "@zcode/contracts";
@@ -31,7 +32,11 @@ import {
 import { closeSessionStore, getSessionDbPath } from "./app/session-store.js";
 import { resolveMcpNodeFallbackProvider } from "./app/mcp-node-fallback.js";
 import { getCliStorageRoot, getProjectMemoryRoot } from "./app/paths.js";
-import { startProcessProviderRegistryRuntime } from "./app/process-provider-registry-runtime.js";
+import {
+  readStandaloneAccountEnabled,
+  resolveProcessProviderRegistryRuntimeOptions,
+  startProcessProviderRegistryRuntime,
+} from "./app/process-provider-registry-runtime.js";
 import { scheduleStartupLogRetentionCleanup } from "./log-retention.js";
 import { resolveProcessProviderEndpointRoutingPort } from "./provider-endpoint-routing.js";
 import { StartupTimer, startupNow } from "./startup-logging.js";
@@ -163,11 +168,18 @@ export async function runZCodeProtocolAgent(
         }),
     });
     const runtimeEnv = options.env ?? process.env;
+    const standaloneAccountEnabled = readStandaloneAccountEnabled(runtimeEnv);
     options.lifecycle?.signal.throwIfAborted();
     providerRegistryRuntime = await acquireProtocolStartupResource({
       signal: options.lifecycle?.signal,
       logger,
-      create: () => startProcessProviderRegistryRuntime(runtimeEnv),
+      // 托管 Worker 的 Registry 事实来自 Host；ZCODE_STANDALONE_ACCOUNT=1 时 app-server
+      // 自己持有账号凭据（CLI `zcode login` 写入的共享 Credential Store），不再依赖 Host。
+      create: () =>
+        startProcessProviderRegistryRuntime(
+          runtimeEnv,
+          resolveProcessProviderRegistryRuntimeOptions(runtimeEnv, logger),
+        ),
       disposeLate: (runtime) => runtime.dispose(),
     });
     options.lifecycle?.signal.throwIfAborted();
@@ -177,6 +189,7 @@ export async function runZCodeProtocolAgent(
       event: "zcode_protocol.provider_registry.ready",
       module: "bootstrap.zcode_protocol",
       providerCount: providerRegistryRuntime.snapshot.registry.providers.length,
+      standaloneAccount: standaloneAccountEnabled,
     });
     const runtimeSurface = resolveProtocolRuntimeSurface(runtimeEnv);
     const telemetryEnv = await acquireProtocolStartupResource({
@@ -333,6 +346,14 @@ export async function runZCodeProtocolAgent(
               }
             : {}),
           providerEndpointRoutingPort,
+          // Standalone 账号下用进程级凭据端口，覆盖 workspace 层 Host 反向请求的回退端口
+          // （createWorkspaceZCodeApp 在 options 里传入的回退端口先落地，这里后展开覆盖）。
+          ...(activeProviderRegistryRuntime.providerRuntimeHeadersPort
+            ? {
+                providerRuntimeHeadersPort:
+                  activeProviderRegistryRuntime.providerRuntimeHeadersPort,
+              }
+            : {}),
           officialCommandEnv: (sessionId, workspace) =>
             activeOfficialCommandEndpoint.envForSession(sessionId, workspace),
           sourceTitle: "electron",
@@ -351,7 +372,14 @@ export async function runZCodeProtocolAgent(
         memoryRoot: ({ workspacePath, workspaceIdentity }) =>
           getProjectMemoryRoot(protocolCliStorageRoot, workspacePath, workspaceIdentity),
       }),
-      syncAccountProviderConfig: activeProviderRegistryRuntime.syncAccountProviderConfig,
+      // Standalone 账号由本进程管理（syncAccountProviderConfig 会拒绝 Host 覆盖），
+      // 只在托管语义下把账号配置同步交给协议层。
+      ...(standaloneAccountEnabled
+        ? {}
+        : {
+            syncAccountProviderConfig:
+              activeProviderRegistryRuntime.syncAccountProviderConfig,
+          }),
       refreshProviderRegistry: async (reason) => {
         await activeProviderRegistryRuntime.runtime.registryService.refresh(reason);
       },

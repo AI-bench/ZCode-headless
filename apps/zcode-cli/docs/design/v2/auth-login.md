@@ -1,3 +1,4 @@
+> Modified in this fork (standalone-account-patches, Apache-2.0): headless login additions — see patch_docs/README.md.
 # Auth Login
 
 ## Project Access Token migration
@@ -250,6 +251,24 @@ the client provides an explicit UX. ZCode app-server should return guidance to r
 
 Headless `zcode login --no-browser` prints the URL and polls normally, which is
 useful for tests, SSH sessions, and remote terminals.
+
+An externally spawned `zcode app-server` (a harness or editor integration, for
+example) normally expects its host to answer the account auth reverse requests.
+Setting `ZCODE_STANDALONE_ACCOUNT=1` (or `true`) opts the process into the
+standalone account runtime instead: the app-server reads the shared credential
+store (`~/.zcode/v2/credentials.json`, written by `zcode login`), resolves
+coding-plan credentials itself through the same PAT pipeline as the TUI, and
+serves provider runtime headers from the process-local port, so no host is
+required. The flag is read only by the app-server entrypoint; desktop-managed
+workers never read it, and leaving it unset keeps host-managed semantics,
+including the `provider/updateAccountConfig` sync and the
+`interaction/requestProviderRuntimeHeaders` reverse request. Under the flag,
+host account-config pushes are rejected ("Account Provider Config runtime is
+not configured") because the standalone account is managed by the process
+itself, and a logged-out store resolves account providers as explicitly not
+entitled. The app-server never opens a browser under the flag either — run
+`zcode login` locally first; credentials are re-read per request, so login and
+logout apply to running app-servers without a restart.
 
 TUI `/login` must also emit the authorization URL as an assistant transcript
 message as soon as Init returns. This is required for SSH and remote-terminal

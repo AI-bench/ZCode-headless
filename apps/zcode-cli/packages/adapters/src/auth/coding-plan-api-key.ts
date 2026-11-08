@@ -1,3 +1,4 @@
+// Modified in this fork (standalone-account-patches, Apache-2.0): see patch_docs/README.md.
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   isHttpClientPortError,
@@ -13,13 +14,18 @@ import {
   resolveBigModelApiOrigin,
   type ProjectAccessTokenMaterial,
 } from "@zcode/shared";
-import { ZaiBusinessTokenCache, type ZaiBusinessToken } from "./zai-business-token-cache.js";
+import {
+  ZaiBusinessTokenCache,
+  type ZaiBusinessToken,
+  type ZaiBusinessTokenPersistence,
+} from "./zai-business-token-cache.js";
 
 const BUSINESS_AUTH_MAX_ATTEMPTS = 2;
 const SINGLE_ATTEMPT = 1;
 const PROJECT_TOKEN_REQUEST_TIMEOUT_MS = 15_000;
 const ZAI_API_HOST = "https://api.z.ai";
 export type CodingPlanFamily = "bigmodel" | "zai";
+export type { ZaiBusinessTokenPersistence };
 export interface CodingPlanApiKeyResolverOptions {
   httpClient: HttpClientPort;
   trace?: TraceContext;
@@ -28,6 +34,8 @@ export interface CodingPlanApiKeyResolverOptions {
     save(key: string, value: string): Promise<void>;
     delete(key: string): Promise<void>;
   };
+  /** 业务 JWT 跨进程持久化；缺省时维持仅内存缓存行为。 */
+  businessTokenPersistence?: ZaiBusinessTokenPersistence;
   observe?(event: { family: string; stage: "resolve"; code: string }): void;
 }
 export interface ResolveCodingPlanApiKeyInput {
@@ -61,12 +69,14 @@ export function createCodingPlanApiKeyResolver(
     trace?: TraceContext;
     business?: ZaiBusinessToken;
   }>();
-  const businessTokens = new ZaiBusinessTokenCache(() =>
-    options.observe?.({
-      family: "zai",
-      stage: "resolve",
-      code: "project_token_business_login_refresh_deferred",
-    }),
+  const businessTokens = new ZaiBusinessTokenCache(
+    () =>
+      options.observe?.({
+        family: "zai",
+        stage: "resolve",
+        code: "project_token_business_login_refresh_deferred",
+      }),
+    options.businessTokenPersistence,
   );
   const request = async (url: string, init: RequestInit) => {
     const response = await options.httpClient
@@ -129,12 +139,16 @@ export function createCodingPlanApiKeyResolver(
       const business =
         input.family === "zai"
           ? await businessTokens
-              .resolve(oauth, () =>
-                request(`${ZAI_API_HOST}/api/auth/z/login`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ token: oauth }),
-                }),
+              .resolve(
+                oauth,
+                () =>
+                  request(`${ZAI_API_HOST}/api/auth/z/login`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ token: oauth }),
+                  }),
+                // accountIdentity 是稳定账号身份，作为持久化业务 JWT 的 scope。
+                input.accountIdentity,
               )
               .catch(() => {
                 options.observe?.({

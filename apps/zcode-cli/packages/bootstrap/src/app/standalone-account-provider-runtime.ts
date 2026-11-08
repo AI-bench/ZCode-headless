@@ -1,6 +1,8 @@
+// Modified in this fork (standalone-account-patches, Apache-2.0): see patch_docs/README.md.
 import { createHash } from "node:crypto";
 import {
   createCodingPlanApiKeyResolver,
+  createZaiBusinessTokenPersistence,
   SHARED_ZCODE_CREDENTIAL_KEYS,
   type SharedZCodeCredentialStore,
 } from "@zcode/adapters/auth";
@@ -193,7 +195,10 @@ export async function hasStandaloneCodingPlanAccess(
 }
 
 export function createStandaloneProviderRuntimeHeadersPort(
-  credentialStore: Pick<SharedZCodeCredentialStore, "load" | "loadMany" | "save" | "delete">,
+  credentialStore: Pick<
+    SharedZCodeCredentialStore,
+    "load" | "loadMany" | "save" | "delete" | "deleteIf"
+  >,
   env: Readonly<Record<string, string | undefined>>,
   injectedResolver?: ReturnType<typeof createCodingPlanApiKeyResolver>,
 ): ProviderRuntimeHeadersPort & {
@@ -212,6 +217,8 @@ export function createStandaloneProviderRuntimeHeadersPort(
         timeoutMs: config.network.timeout,
       }),
       locationStore: credentialStore,
+      // 业务 JWT 写透共享凭据 Store：新进程直接复用，不再依赖短期 oauth 重新换证。
+      businessTokenPersistence: createZaiBusinessTokenPersistence(credentialStore),
       observe: (event) => console.warn("[project-access-token]", event),
     });
   const authSnapshots = new Map<string, string>();

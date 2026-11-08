@@ -1,3 +1,4 @@
+// Modified in this fork (standalone-account-patches, Apache-2.0): see patch_docs/README.md.
 /* eslint-disable max-lines -- OAuth 凭据仓储集中维护 ZAI/BigModel 登录镜像 key 边界，拆分会让鉴权事实源更难追踪。 */
 import { Buffer } from "node:buffer";
 import type {
@@ -13,6 +14,10 @@ import { createServiceLogger } from "../../logger/serviceLogger.js";
 const ACTIVE_PROVIDER_KEY = "oauth:active_provider";
 const LOGIN_ATTRIBUTION_KEY = "oauth:login_attribution";
 const ZCODE_JWT_TOKEN_KEY = "zcodejwttoken";
+// CLI 换证 adapter（apps/zcode-cli packages/adapters shared-credentials）把 ~180 天
+// 业务 JWT 持久化到该 key，与 App 共享同一份 credentials.json。它是 zaiAccessToken
+// 的派生凭据，App 侧退出/切换账号必须与 CLI 的 clearZaiLoginCredentials 一并清除。
+const ZAI_BUSINESS_TOKEN_KEY = "oauth:zai:business_token";
 const KNOWN_OAUTH_PROVIDER_IDS = [BIGMODEL_PROVIDER_ID, ZAI_PROVIDER_ID] as const;
 const log = createServiceLogger("oauthCredentialRepo");
 
@@ -437,6 +442,9 @@ export class OAuthCredentialRepo {
     await this.credentialService.delete(userInfoKey(provider));
     if (shouldClearZcodeJwtOnLogout(provider)) {
       await this.credentialService.delete(ZCODE_JWT_TOKEN_KEY);
+    }
+    if (provider === ZAI_PROVIDER_ID) {
+      await this.credentialService.delete(ZAI_BUSINESS_TOKEN_KEY);
     }
   }
 

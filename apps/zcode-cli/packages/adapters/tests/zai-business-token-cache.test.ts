@@ -1,6 +1,11 @@
+// Modified in this fork (standalone-account-patches, Apache-2.0): see patch_docs/README.md.
 import { afterEach, expect, it, vi } from "vitest";
 import { ProjectAccessTokenTransientError } from "@zcode/shared";
-import { ZaiBusinessTokenCache } from "../src/auth/zai-business-token-cache.js";
+import {
+  ZaiBusinessTokenCache,
+  type ZaiBusinessToken,
+  type ZaiBusinessTokenPersistence,
+} from "../src/auth/zai-business-token-cache.js";
 afterEach(() => vi.useRealTimers());
 it("无 TTL 的成功响应只做有限缓存", async () => {
   vi.useFakeTimers();
@@ -144,4 +149,146 @@ it("退出和换登录拒绝迟到响应，旧 401 不影响新结果", async ()
       throw Error("unexpected exchange");
     }),
   ).toBe(next);
+});
+
+function createMemoryPersistence(initial?: { value: ZaiBusinessToken; scope?: string }) {
+  let stored = initial;
+  const calls = { load: [] as (string | undefined)[], remove: [] as string[], save: 0 };
+  const persistence: ZaiBusinessTokenPersistence = {
+    async load(scope) {
+      calls.load.push(scope);
+      if (!stored || stored.scope !== scope) return undefined;
+      return stored.value;
+    },
+    async remove(token) {
+      calls.remove.push(token);
+      if (stored?.value.token === token) stored = undefined;
+    },
+    async save(value, scope) {
+      calls.save++;
+      stored = { value, scope };
+    },
+  };
+  return {
+    calls,
+    persistence,
+    stored: () => stored,
+    seed: (value: ZaiBusinessToken, scope?: string) => {
+      stored = { value, scope };
+    },
+  };
+}
+
+it("换证成功写透持久化；未知有效期不落盘", async () => {
+  vi.useFakeTimers();
+  const opaque = createMemoryPersistence();
+  const opaqueCache = new ZaiBusinessTokenCache(undefined, opaque.persistence);
+  await opaqueCache.resolve("oauth", async () => ({ data: { access_token: "opaque-token" } }));
+  expect(opaque.calls.save).toBe(0);
+
+  const persisted = createMemoryPersistence();
+  const cache = new ZaiBusinessTokenCache(undefined, persisted.persistence);
+  const value = await cache.resolve(
+    "oauth",
+    async () => ({ data: { access_token: "business-token", expires_in: 600 } }),
+    "user-1",
+  );
+  expect(persisted.calls.save).toBe(1);
+  expect(persisted.stored()).toEqual({
+    value,
+    scope: "user-1",
+  });
+  expect(persisted.stored()?.value.expiresAt).toBe(Date.now() + 600_000);
+});
+
+it("新进程领养未过期的持久化副本，不再换证", async () => {
+  vi.useFakeTimers();
+  const start = Date.now();
+  const memory = createMemoryPersistence();
+  memory.seed(
+    Object.freeze({
+      token: "persisted-token",
+      expiresAt: start + 600_000,
+      refreshAt: start + 480_000,
+    }),
+    "user-1",
+  );
+  const cache = new ZaiBusinessTokenCache(undefined, memory.persistence);
+  const exchange = vi.fn(async () => ({ data: { access_token: "exchanged-token" } }));
+  const value = await cache.resolve("oauth", exchange, "user-1");
+  expect(value.token).toBe("persisted-token");
+  expect(exchange).not.toHaveBeenCalled();
+  expect(memory.calls.load).toEqual(["user-1"]);
+  // 领养副本进入内存后与换证结果同语义：未到刷新窗口前并发复用。
+  expect(await cache.resolve("oauth", exchange, "user-1")).toBe(value);
+  expect(exchange).not.toHaveBeenCalled();
+});
+
+it("持久化副本进入刷新窗口即视为缺席，回退换证并覆盖记录", async () => {
+  vi.useFakeTimers();
+  const start = Date.now();
+  const memory = createMemoryPersistence();
+  memory.seed(
+    Object.freeze({
+      token: "stale-token",
+      expiresAt: start + 600_000,
+      refreshAt: start + 480_000,
+    }),
+    "user-1",
+  );
+  vi.setSystemTime(start + 481_000);
+  const cache = new ZaiBusinessTokenCache(undefined, memory.persistence);
+  const value = await cache.resolve(
+    "oauth",
+    async () => ({ data: { access_token: "fresh-token", expires_in: 600 } }),
+    "user-1",
+  );
+  expect(value.token).toBe("fresh-token");
+  expect(memory.stored()?.value.token).toBe("fresh-token");
+});
+
+it("401 拒绝的持久化副本不得再次领养，并撤掉落盘记录", async () => {
+  vi.useFakeTimers();
+  const start = Date.now();
+  const memory = createMemoryPersistence();
+  memory.seed(
+    Object.freeze({
+      token: "rejected-token",
+      expiresAt: start + 600_000,
+      refreshAt: start + 480_000,
+    }),
+    "user-1",
+  );
+  const cache = new ZaiBusinessTokenCache(undefined, memory.persistence);
+  const adopted = await cache.resolve("oauth", vi.fn(), "user-1");
+  expect(adopted.token).toBe("rejected-token");
+  cache.invalidate(adopted);
+  // 迟到的 401 已撤内存与持久化；下一次必须重新换证。
+  const exchange = vi.fn(async () => ({ data: { access_token: "fresh-token", expires_in: 600 } }));
+  const value = await cache.resolve("oauth", exchange, "user-1");
+  expect(value.token).toBe("fresh-token");
+  expect(exchange).toHaveBeenCalledTimes(1);
+  expect(memory.calls.remove).toEqual(["rejected-token"]);
+  expect(memory.stored()?.value.token).toBe("fresh-token");
+});
+
+it("持久化读写失败退化为仅内存行为，不影响换证结果", async () => {
+  vi.useFakeTimers();
+  const broken: ZaiBusinessTokenPersistence = {
+    load: async () => {
+      throw new Error("store unreadable");
+    },
+    remove: async () => {
+      throw new Error("store unreadable");
+    },
+    save: async () => {
+      throw new Error("store unwritable");
+    },
+  };
+  const cache = new ZaiBusinessTokenCache(undefined, broken);
+  const exchange = vi.fn(async () => ({ data: { access_token: "business-token", expires_in: 600 } }));
+  const value = await cache.resolve("oauth", exchange, "user-1");
+  expect(value.token).toBe("business-token");
+  expect(await cache.resolve("oauth", exchange, "user-1")).toBe(value);
+  expect(exchange).toHaveBeenCalledTimes(1);
 });

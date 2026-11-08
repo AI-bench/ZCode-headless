@@ -1,3 +1,4 @@
+// Modified in this fork (standalone-account-patches, Apache-2.0): see patch_docs/README.md.
 export { hasConfiguredStandaloneCodingPlan, logoutZCodeCli } from "./auth-login-persistence.js";
 import {
   persistStandaloneCodingPlanConnection,
@@ -28,6 +29,7 @@ import {
 import {
   createCodingPlanApiKeyResolver,
   createSharedZCodeCredentialStore,
+  createZaiBusinessTokenPersistence,
   createCliOAuthClient,
   createCliOAuthPollToken,
   openUrlInBrowser,
@@ -56,7 +58,10 @@ export async function loginZCodeCli(
   const env = options.env ?? process.env;
   const providerId = options.providerId ?? "zai";
   const now = options.now ?? Date.now;
-  const timeoutMs = options.timeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS;
+  const envTimeoutMs = Number.parseInt(env.ZCODE_LOGIN_TIMEOUT_MS ?? "", 10);
+  const timeoutMs =
+    options.timeoutMs ??
+    (Number.isFinite(envTimeoutMs) && envTimeoutMs > 0 ? envTimeoutMs : DEFAULT_LOGIN_TIMEOUT_MS);
   const deadlineMs = now() + timeoutMs;
   const timeoutController = new AbortController();
   const signal = options.abortSignal
@@ -106,6 +111,14 @@ export async function loginZCodeCli(
         family: providerId,
         resolver: options.apiKeyResolver,
         signal,
+        // 登录期换得的业务 JWT（~180 天）当场写透凭据 Store；Z.ai 用 user_id 作
+        // 持久化 scope，与运行时 refresh 传入的 accountIdentity 对齐。
+        ...(providerId === "zai"
+          ? {
+              businessTokenPersistence: createZaiBusinessTokenPersistence(credentialStore),
+              accountIdentity: readyData.user.user_id,
+            }
+          : {}),
       }),
       signal,
     );
@@ -245,16 +258,24 @@ async function resolveCodingPlanMaterial(input: {
   family: CodingPlanProviderId;
   signal?: AbortSignal;
   resolver?: ReturnType<typeof createCodingPlanApiKeyResolver>;
+  businessTokenPersistence?: Parameters<
+    typeof createCodingPlanApiKeyResolver
+  >[0]["businessTokenPersistence"];
+  accountIdentity?: string;
 }) {
   const resolver =
     input.resolver ??
     createCodingPlanApiKeyResolver({
       httpClient: input.httpClient ?? createDefaultHttpClient(input.env),
+      businessTokenPersistence: input.businessTokenPersistence,
     });
   return resolver.resolveMaterial(
     {
       accessToken: input.accessToken,
       family: input.family,
+      ...(input.accountIdentity === undefined
+        ? {}
+        : { accountIdentity: input.accountIdentity }),
     },
     { signal: input.signal },
   );
